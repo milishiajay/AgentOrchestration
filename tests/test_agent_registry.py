@@ -1,5 +1,5 @@
 import pytest
-from src.agent.registry import AgentRegistry, AgentStatus
+from src.agent.registry import AgentRegistry, AgentStatus, _DISABLED_STATUSES
 
 
 class TestAgentRegistry:
@@ -48,110 +48,111 @@ class TestAgentRegistry:
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
 
-# 2019-01-23T10:28:57 update
+    # --- Issue #545: disabled entries must not leak in default listings ---
 
-# 2019-01-28T18:15:57 update
+    def test_list_excludes_disabled_by_default(self):
+        """Default list() should not return stopped/failed/terminated agents."""
+        a1 = self.registry.register("alive", "worker.proc")
+        a2 = self.registry.register("dead", "worker.proc")
+        a3 = self.registry.register("crashed", "worker.proc")
+        a4 = self.registry.register("gone", "worker.proc")
 
-# 2019-02-22T11:46:37 update
+        self.registry.update_status(a2, AgentStatus.STOPPED)
+        self.registry.update_status(a3, AgentStatus.FAILED)
+        self.registry.update_status(a4, AgentStatus.TERMINATED)
 
-# 2019-03-27T14:43:52 update
+        agents = self.registry.list()
+        assert len(agents) == 1
+        assert agents[0]["id"] == a1
 
-# 2019-04-12T16:58:25 update
+    def test_list_include_disabled_true_returns_all(self):
+        """list(include_disabled=True) should return all agents including disabled."""
+        a1 = self.registry.register("alive", "worker.proc")
+        a2 = self.registry.register("dead", "worker.proc")
 
-# 2019-05-27T15:15:18 update
+        self.registry.update_status(a2, AgentStatus.STOPPED)
 
-# 2019-07-17T14:36:58 update
+        agents = self.registry.list(include_disabled=True)
+        assert len(agents) == 2
 
-# 2019-09-06T12:29:31 update
+    def test_list_with_explicit_disabled_status(self):
+        """When a specific disabled status is requested, it should be returned
+        even without include_disabled."""
+        a1 = self.registry.register("alive", "worker.proc")
+        a2 = self.registry.register("dead", "worker.proc")
+        self.registry.update_status(a2, AgentStatus.TERMINATED)
 
-# 2019-11-27T17:43:26 update
+        agents = self.registry.list(status=AgentStatus.TERMINATED)
+        assert len(agents) == 1
+        assert agents[0]["id"] == a2
 
-# 2019-11-28T08:42:43 update
+    def test_count_excludes_disabled_by_default(self):
+        """Default count() should exclude disabled agents."""
+        a1 = self.registry.register("alive", "worker.proc")
+        a2 = self.registry.register("stopped", "worker.proc")
+        self.registry.update_status(a2, AgentStatus.STOPPED)
 
-# 2019-12-03T20:34:02 update
+        assert self.registry.count() == 1
 
-# 2019-12-26T08:15:09 update
+    def test_count_include_disabled_true(self):
+        """count(include_disabled=True) should include all."""
+        a1 = self.registry.register("alive", "worker.proc")
+        a2 = self.registry.register("stopped", "worker.proc")
+        self.registry.update_status(a2, AgentStatus.STOPPED)
 
-# 2020-01-07T09:36:32 update
+        assert self.registry.count(include_disabled=True) == 2
 
-# 2020-01-10T12:44:52 update
+    def test_group_index_cleaned_on_disable(self):
+        """When an agent moves to a disabled state, it should be removed
+        from the group index so group queries don't leak it."""
+        a1 = self.registry.register("alive", "worker.proc")
+        a2 = self.registry.register("dead", "worker.proc")
+        self.registry.update_status(a2, AgentStatus.TERMINATED)
 
-# 2020-07-05T19:33:32 update
+        workers = self.registry.list(group="worker")
+        assert len(workers) == 1
+        assert workers[0]["id"] == a1
 
-# 2020-07-07T14:16:11 update
+    def test_group_query_with_include_disabled(self):
+        """Group query with include_disabled should return disabled members."""
+        a1 = self.registry.register("alive", "worker.proc")
+        a2 = self.registry.register("dead", "worker.proc")
+        self.registry.update_status(a2, AgentStatus.TERMINATED)
 
-# 2020-07-28T08:29:39 update
+        # With include_disabled, it searches all agents (not just index)
+        workers = self.registry.list(group="worker", include_disabled=True)
+        assert len(workers) == 2
+        ids = {a["id"] for a in workers}
+        assert ids == {a1, a2}
 
-# 2020-08-26T18:58:21 update
+    def test_transition_from_disabled_to_active_restores_to_index(self):
+        """Moving an agent from disabled back to active should be possible
+        and it should reappear in default listings."""
+        agent_id = self.registry.register("zombie", "worker.proc")
+        self.registry.update_status(agent_id, AgentStatus.TERMINATED)
+        assert self.registry.count() == 0
+        assert len(self.registry.list(group="worker")) == 0
 
-# 2020-08-28T09:50:37 update
+        # Bring it back
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert self.registry.count() == 1
+        assert len(self.registry.list(group="worker")) == 1
 
-# 2020-09-17T15:23:33 update
+    def test_all_disabled_statuses_filtered(self):
+        """Verify STOPPED, FAILED, and TERMINATED are all filtered by default."""
+        for status in _DISABLED_STATUSES:
+            reg = AgentRegistry()
+            reg.register("alive", "worker.proc")
+            a2 = reg.register("disabled", "worker.proc")
+            reg.update_status(a2, AgentStatus(status))
+            assert reg.count() == 1, f"{status} should be excluded from count"
+            assert len(reg.list()) == 1, f"{status} should be excluded from list"
 
-# 2020-09-23T16:22:24 update
-
-# 2020-10-14T13:27:24 update
-
-# 2020-11-20T11:40:04 update
-
-# 2020-12-10T13:55:01 update
-
-# 2020-12-25T20:33:02 update
-
-# 2021-03-22T19:53:48 update
-
-# 2021-03-26T15:02:19 update
-
-# 2021-07-16T20:24:40 update
-
-# 2021-07-22T13:19:23 update
-
-# 2021-08-16T19:11:26 update
-
-# 2021-10-02T13:32:20 update
-
-# 2021-10-23T18:31:31 update
-
-# 2021-10-29T13:55:10 update
-
-# 2022-07-31T17:35:39 update
-
-# 2022-09-27T09:32:34 update
-
-# 2022-11-07T14:44:52 update
-
-# 2023-01-23T14:07:09 update
-
-# 2023-03-16T15:23:38 update
-
-# 2023-07-03T18:33:44 update
-
-# 2023-07-27T09:35:11 update
-
-# 2023-11-16T11:22:59 update
-
-# 2023-12-20T14:25:29 update
-
-# 2024-03-07T17:32:49 update
-
-# 2024-04-10T10:50:42 update
-
-# 2024-06-19T19:57:49 update
-
-# 2024-12-05T18:02:46 update
-
-# 2025-01-15T16:13:24 update
-
-# 2025-03-12T20:58:57 update
-
-# 2025-06-24T20:33:23 update
-
-# 2025-08-25T10:56:35 update
-
-# 2025-09-12T17:09:51 update
-
-# 2025-10-06T20:01:10 update
-
-# 2025-10-14T11:48:40 update
-
-# 2026-01-29T13:09:29 update
+    def test_pending_and_running_not_disabled(self):
+        """PENDING, RUNNING, and PAUSED should still appear in default listings."""
+        for status in [AgentStatus.PENDING, AgentStatus.RUNNING, AgentStatus.PAUSED]:
+            reg = AgentRegistry()
+            agent_id = reg.register("agent", "worker.proc")
+            reg.update_status(agent_id, status)
+            assert reg.count() == 1, f"{status} should be included in count"
+            assert len(reg.list()) == 1, f"{status} should be included in list"

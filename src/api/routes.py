@@ -10,9 +10,11 @@ registry = AgentRegistry()
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(status: Optional[str] = None, group: Optional[str] = None,
+                      include_disabled: bool = False):
     status_filter = AgentStatus(status) if status else None
-    return {"agents": registry.list(status=status_filter, group=group)}
+    return {"agents": registry.list(status=status_filter, group=group,
+                                    include_disabled=include_disabled)}
 
 
 @router.post("/agents")
@@ -51,8 +53,8 @@ async def stop_agent(agent_id: str):
 
 
 @router.get("/agents/count")
-async def agent_count():
-    return {"count": registry.count()}
+async def agent_count(include_disabled: bool = False):
+    return {"count": registry.count(include_disabled=include_disabled)}
 
 # 2019-03-18T11:10:18 update
 

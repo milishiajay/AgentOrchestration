@@ -16,6 +16,10 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+# Statuses considered "disabled" — these should not appear in default listings
+_DISABLED_STATUSES = {AgentStatus.STOPPED.value, AgentStatus.FAILED.value, AgentStatus.TERMINATED.value}
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
@@ -45,20 +49,42 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None,
+             include_disabled: bool = False) -> List[Dict[str, Any]]:
         agents = self._agents.values()
+        if not include_disabled and status is None:
+            # Default: exclude disabled (terminal) entries from listings
+            agents = [a for a in agents if a["status"] not in _DISABLED_STATUSES]
         if status:
             agents = [a for a in agents if a["status"] == status.value]
         if group:
-            agent_ids = self._index.get(group, [])
-            agents = [a for a in agents if a["id"] in agent_ids]
+            if include_disabled or status:
+                # When including disabled or filtering by status,
+                # scan all agents rather than relying on the cleaned index
+                agents = [a for a in agents if a["type"].split(".")[0] == group]
+            else:
+                agent_ids = self._index.get(group, [])
+                agents = [a for a in agents if a["id"] in agent_ids]
         return list(agents)
 
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
         if agent_id not in self._agents:
             return False
+        old_status = self._agents[agent_id]["status"]
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        agent = self._agents[agent_id]
+        group = agent["type"].split(".")[0]
+        # When an agent enters a disabled state, remove it from the group index
+        if status.value in _DISABLED_STATUSES:
+            if group in self._index and agent_id in self._index[group]:
+                self._index[group].remove(agent_id)
+        # When an agent transitions from disabled back to active, restore to index
+        elif old_status in _DISABLED_STATUSES:
+            if group not in self._index:
+                self._index[group] = []
+            if agent_id not in self._index[group]:
+                self._index[group].append(agent_id)
         return True
 
     def delete(self, agent_id: str) -> bool:
@@ -70,8 +96,10 @@ class AgentRegistry:
             self._index[group].remove(agent_id)
         return True
 
-    def count(self) -> int:
-        return len(self._agents)
+    def count(self, include_disabled: bool = False) -> int:
+        if include_disabled:
+            return len(self._agents)
+        return sum(1 for a in self._agents.values() if a["status"] not in _DISABLED_STATUSES)
 
 # 2019-01-29T11:24:49 update
 
