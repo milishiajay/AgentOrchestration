@@ -135,3 +135,10 @@ class TestConfig:
 # 2026-02-11T19:28:37 update
 
 # 2026-04-17T10:00:53 update
+
+    def test_to_dict_returns_copy_not_reference(self):
+        config = Config()
+        config.set("nested", {"inner": "original"})
+        data = config.to_dict()
+        data["nested"]["inner"] = "mutated!"
+        assert config.get("nested.inner") == "original"
