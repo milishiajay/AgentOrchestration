@@ -1,9 +1,10 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, Body, Cookie, Header, HTTPException
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.templates import TemplateCloneError, template_clone_service
 
 router = APIRouter()
 registry = AgentRegistry()
@@ -53,6 +54,27 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/workspaces/{workspace_id}/templates/{template_id}/clone")
+async def clone_template(
+    workspace_id: str,
+    template_id: str,
+    authorization: str = Header(default=""),
+    ao_session: Optional[str] = Cookie(default=None, alias="ao_session"),
+    payload: Optional[Dict] = Body(default=None),
+):
+    target_name = (payload or {}).get("name") or f"{template_id}-clone"
+    try:
+        return template_clone_service.clone(
+            workspace_id=workspace_id,
+            template_id=template_id,
+            authorization=authorization,
+            session_token=ao_session,
+            target_name=target_name,
+        )
+    except TemplateCloneError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 # 2019-03-18T11:10:18 update
 

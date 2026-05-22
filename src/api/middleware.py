@@ -11,10 +11,26 @@ logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        is_protected_api = (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        )
+        if is_protected_api:
             token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
+            session_cookie = request.cookies.get("ao_session")
+            session_auth_path = (
+                "/templates/" in request.url.path
+                and request.url.path.endswith("/clone")
+            )
+            if (
+                not token.startswith("Bearer ")
+                and not (session_auth_path and session_cookie is not None)
+            ):
                 return Response(status_code=401, content="Unauthorized")
         return await call_next(request)
 
