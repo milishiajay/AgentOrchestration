@@ -153,3 +153,15 @@ class TestTaskScheduler:
 # 2026-01-12T16:53:28 update
 
 # 2026-04-16T16:58:23 update
+
+    def test_reclaim_abandoned_jobs(self):
+        scheduler = TaskScheduler()
+        scheduler.enqueue({"type": "test", "payload": {}}, queue="default")
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        assert task is not None
+        scheduler._in_flight[task["id"]]["dequeued_at"] = 0
+        reclaimed = scheduler.reclaim_abandoned(timeout_seconds=0)
+        assert reclaimed == 1
+        task2 = asyncio.run(scheduler.dequeue())
+        assert task2 is not None

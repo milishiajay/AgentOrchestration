@@ -65,12 +65,27 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                task["dequeued_at"] = now
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
         return self._in_flight.pop(task_id, None) is not None
+
+
+    def reclaim_abandoned(self, timeout_seconds: float = 300.0) -> int:
+        now = time.time()
+        reclaimed = 0
+        for task_id, task in list(self._in_flight.items()):
+            started = task.get("dequeued_at", task.get("enqueued_at", 0))
+            if now - started > timeout_seconds:
+                self._in_flight.pop(task_id)
+                task["retries"] += 1
+                if task["retries"] < self._max_retries:
+                    self.enqueue(task, task.get("queue", "default"), priority=task.get("priority", 0))
+                reclaimed += 1
+        return reclaimed
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
