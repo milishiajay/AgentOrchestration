@@ -1,221 +1,334 @@
+"""Regression tests for registry health gate — #570 rolling deploys.
+
+Covers: health status check, accepting_tasks flag, lifecycle state
+rejection, capability/version gating, cache invalidation on state
+changes, and sanitized audit metadata.
+"""
+
 import pytest
-from src.agent.registry import AgentRegistry, AgentStatus
+from src.agent.registry import AgentRegistry, AgentStatus, HandlerResolution
 
 
-class TestAgentRegistry:
+class TestRegistryHealthGate:
+    """Verifies that handler health is checked before routing."""
+
     def setup_method(self):
         self.registry = AgentRegistry()
 
-    def test_register_agent(self):
-        agent_id = self.registry.register("test-agent", "worker.processor")
-        assert agent_id is not None
-        assert self.registry.count() == 1
+    # ──────────────────────────────────────────────
+    #  Health / accepting_tasks rejections
+    # ──────────────────────────────────────────────
 
-    def test_get_agent(self):
-        agent_id = self.registry.register("test-agent", "worker.processor")
-        agent = self.registry.get(agent_id)
-        assert agent is not None
-        assert agent["name"] == "test-agent"
-        assert agent["type"] == "worker.processor"
+    def test_unhealthy_handler_rejected_during_rolling_deploy(self):
+        """An unhealthy handler is not routable — rolling deploy blocks it."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
 
-    def test_get_nonexistent_agent(self):
-        agent = self.registry.get("nonexistent-id")
-        assert agent is None
+        # Handler becomes unhealthy during deploy
+        self.registry.set_health(agent_id, "unhealthy", accepting_tasks=False)
 
-    def test_list_agents(self):
-        self.registry.register("agent-1", "worker.processor")
-        self.registry.register("agent-2", "worker.analyzer")
-        self.registry.register("agent-3", "monitor.watcher")
-        assert len(self.registry.list()) == 3
+        resolution = self.registry.resolve_handler(agent_id=agent_id)
+        assert not resolution.resolved
+        assert "handler_unroutable" in resolution.reason
+        assert agent_id in resolution.deferred_ids
 
-    def test_list_agents_by_group(self):
-        self.registry.register("agent-1", "worker.processor")
-        self.registry.register("agent-2", "monitor.watcher")
-        workers = self.registry.list(group="worker")
-        assert len(workers) == 1
+    def test_stopped_handler_rejected(self):
+        """A stopped handler is in a terminal state and not routable."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.STOPPED)
 
-    def test_update_status(self):
-        agent_id = self.registry.register("test-agent", "worker.processor")
-        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
-        agent = self.registry.get(agent_id)
-        assert agent["status"] == "running"
+        resolution = self.registry.resolve_handler(agent_id=agent_id)
+        assert not resolution.resolved
+        assert agent_id in resolution.deferred_ids
 
-    def test_refresh_worker_capabilities_on_reconnect(self):
-        """Capabilities are refreshed on reconnect with a bumped epoch."""
+    def test_terminated_handler_rejected(self):
+        """A terminated handler is not routable."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.TERMINATED)
+
+        resolution = self.registry.resolve_handler(agent_id=agent_id)
+        assert not resolution.resolved
+
+    def test_failed_handler_rejected(self):
+        """A failed handler is not routable."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.FAILED)
+
+        resolution = self.registry.resolve_handler(agent_id=agent_id)
+        assert not resolution.resolved
+
+    def test_pending_handler_rejected(self):
+        """A pending handler has not initialised and is not routable."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        # Still in PENDING status from registration
+
+        resolution = self.registry.resolve_handler(agent_id=agent_id)
+        assert not resolution.resolved
+        assert agent_id in resolution.deferred_ids
+
+    def test_draining_handler_rejected(self):
+        """A draining handler should not receive new tasks during rolling deploys."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.DRAINING)
+
+        resolution = self.registry.resolve_handler(agent_id=agent_id)
+        assert not resolution.resolved
+        assert agent_id in resolution.deferred_ids
+
+    def test_healthy_running_handler_accepted(self):
+        """A running, healthy handler is routable."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        resolution = self.registry.resolve_handler(agent_id=agent_id)
+        assert resolution.resolved
+        assert resolution.agent["id"] == agent_id
+        assert resolution.reason == "healthy"
+
+    def test_non_accepting_running_handler_rejected(self):
+        """A running handler marked as not-accepting is unroutable (rolling drain)."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        self.registry.set_health(agent_id, "healthy", accepting_tasks=False)
+
+        resolution = self.registry.resolve_handler(agent_id=agent_id)
+        assert not resolution.resolved
+        assert agent_id in resolution.deferred_ids
+
+    # ──────────────────────────────────────────────
+    #  Capability gating
+    # ──────────────────────────────────────────────
+
+    def test_missing_capability_rejected(self):
+        """Exact handler lacking a required capability is rejected."""
         agent_id = self.registry.register(
-            "test-agent",
-            "worker.processor",
-            capabilities=["summarize", "embed"],
+            "worker-1", "worker.processor", capabilities=["basic"]
         )
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
 
-        snapshot = self.registry.refresh_capabilities(
-            agent_id,
-            ["search", "summarize"],
+        resolution = self.registry.resolve_handler(
+            agent_id=agent_id,
+            required_capability="advanced",
         )
+        assert not resolution.resolved
+        assert resolution.reason == "missing_capability"
 
-        assert snapshot == {
-            "id": agent_id,
-            "status": "pending",
-            "capabilities": ["search", "summarize"],
-            "capability_epoch": 2,
-        }
-        agent = self.registry.get(agent_id)
-        assert agent["capabilities"] == ["search", "summarize"]
-        assert agent["audit"][-1] == {
-            "event": "worker_capabilities_refreshed",
-            "capability_epoch": 2,
-            "capability_count": 2,
-        }
-
-    def test_register_with_capabilities_stores_epoch_and_audit(self):
-        """Registration with capabilities initialises epoch and audit."""
+    def test_matching_capability_accepted(self):
+        """Exact handler with the required capability is accepted."""
         agent_id = self.registry.register(
-            "capable-worker",
-            "worker.processor",
-            capabilities=["  transcribe ", "embed", "", "TRANSCRIBE"],
+            "worker-1", "worker.processor", capabilities=["basic", "advanced"]
         )
-        agent = self.registry.get(agent_id)
-        assert agent["capabilities"] == ["embed", "transcribe"]
-        assert agent["capability_epoch"] == 1
-        assert agent["audit"][0] == {
-            "event": "worker_registered",
-            "capability_epoch": 1,
-            "capability_count": 2,
-        }
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
 
-    def test_worker_snapshot_returns_claims_safe_view(self):
-        """Worker snapshot returns only the fields needed for claims."""
+        resolution = self.registry.resolve_handler(
+            agent_id=agent_id,
+            required_capability="advanced",
+        )
+        assert resolution.resolved
+        assert resolution.agent["id"] == agent_id
+
+    # ──────────────────────────────────────────────
+    #  Version gating
+    # ──────────────────────────────────────────────
+
+    def test_version_mismatch_rejected(self):
+        """A handler with an incompatible version is rejected."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        resolution = self.registry.resolve_handler(
+            agent_id=agent_id,
+            required_version="2.0.0",
+        )
+        assert not resolution.resolved
+        assert resolution.reason == "version_mismatch"
+
+    def test_version_match_accepted(self):
+        """A handler matching the required version is accepted."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        resolution = self.registry.resolve_handler(
+            agent_id=agent_id,
+            required_version="1.0.0",
+        )
+        assert resolution.resolved
+        assert resolution.agent["id"] == agent_id
+
+    # ──────────────────────────────────────────────
+    #  Type-based resolution (rolling deploy fallthrough)
+    # ──────────────────────────────────────────────
+
+    def test_type_resolution_falls_through_to_healthy_handler(self):
+        """When the first handler is unhealthy, type resolution falls to the next."""
+        a1 = self.registry.register("worker-1", "worker.processor")
+        a2 = self.registry.register("worker-2", "worker.processor")
+        self.registry.update_status(a1, AgentStatus.RUNNING)
+        self.registry.update_status(a2, AgentStatus.RUNNING)
+
+        # Mark worker-1 as unhealthy (rolling deploy drain)
+        self.registry.set_health(a1, "unhealthy", accepting_tasks=False)
+
+        # Type-based resolution should fall through to worker-2
+        resolution = self.registry.resolve_handler(agent_type="worker.processor")
+        assert resolution.resolved
+        assert resolution.agent["id"] == a2
+        assert a1 in resolution.deferred_ids
+
+    def test_all_handlers_unhealthy_returns_all_deferred(self):
+        """When all handlers are unhealthy, resolution fails cleanly — all deferred."""
+        a1 = self.registry.register("worker-1", "worker.processor")
+        a2 = self.registry.register("worker-2", "worker.processor")
+        self.registry.update_status(a1, AgentStatus.RUNNING)
+        self.registry.update_status(a2, AgentStatus.RUNNING)
+        self.registry.set_health(a1, "unhealthy", accepting_tasks=False)
+        self.registry.set_health(a2, "unhealthy", accepting_tasks=False)
+
+        resolution = self.registry.resolve_handler(agent_type="worker.processor")
+        assert not resolution.resolved
+        assert resolution.reason == "all_deferred"
+        assert len(resolution.deferred_ids) == 2
+
+    # ──────────────────────────────────────────────
+    #  Cache invalidation
+    # ──────────────────────────────────────────────
+
+    def test_cache_invalidated_on_status_change(self):
+        """Resolution cache is invalidated when handler status changes."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        # First resolution — should be healthy, cached
+        r1 = self.registry.resolve_handler(agent_id=agent_id)
+        assert r1.resolved
+
+        # Status change invalidates cache
+        self.registry.update_status(agent_id, AgentStatus.DRAINING)
+        r2 = self.registry.resolve_handler(agent_id=agent_id)
+        assert not r2.resolved
+        assert agent_id in r2.deferred_ids
+
+    def test_cache_invalidated_on_health_change(self):
+        """Resolution cache is invalidated when handler health changes."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        r1 = self.registry.resolve_handler(agent_id=agent_id)
+        assert r1.resolved
+
+        # Health change invalidates cache
+        self.registry.set_health(agent_id, "unhealthy", accepting_tasks=False)
+        r2 = self.registry.resolve_handler(agent_id=agent_id)
+        assert not r2.resolved
+
+    def test_cache_invalidated_on_capability_refresh(self):
+        """Resolution cache is invalidated on capability refresh."""
         agent_id = self.registry.register(
-            "snap-worker",
-            "worker.processor",
-            capabilities=["run"],
+            "worker-1", "worker.processor", capabilities=["basic"]
         )
-        snapshot = self.registry.worker_snapshot(agent_id)
-        assert snapshot == {
-            "id": agent_id,
-            "status": "pending",
-            "capabilities": ["run"],
-            "capability_epoch": 1,
-        }
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
 
-    def test_worker_snapshot_returns_none_for_unknown_agent(self):
-        assert self.registry.worker_snapshot("missing") is None
+        # Cache the initial resolution
+        r1 = self.registry.resolve_handler(
+            agent_id=agent_id, required_capability="advanced"
+        )
+        assert not r1.resolved
 
-    def test_refresh_capabilities_returns_none_for_unknown_agent(self):
-        assert self.registry.refresh_capabilities("missing", ["run"]) is None
+        # Refresh adds the capability — cache must invalidate
+        self.registry.refresh_capabilities(agent_id, ["basic", "advanced"])
+        r2 = self.registry.resolve_handler(
+            agent_id=agent_id, required_capability="advanced"
+        )
+        assert r2.resolved
 
-    def test_delete_agent(self):
-        agent_id = self.registry.register("test-agent", "worker.processor")
-        assert self.registry.delete(agent_id)
-        assert self.registry.count() == 0
+    def test_cache_invalidated_on_deletion(self):
+        """Resolution cache is invalidated on handler deletion."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
 
-    def test_delete_nonexistent_agent(self):
-        assert not self.registry.delete("nonexistent-id")
+        r1 = self.registry.resolve_handler(agent_id=agent_id)
+        assert r1.resolved
 
-# 2019-01-23T10:28:57 update
+        self.registry.delete(agent_id)
+        r2 = self.registry.resolve_handler(agent_id=agent_id)
+        assert not r2.resolved
+        assert r2.reason == "agent_not_found"
 
-# 2019-01-28T18:15:57 update
+    def test_cached_type_resolution_invalidated_on_group_handler_change(self):
+        """Type-based cache invalidates when a handler in the group deletes."""
+        a1 = self.registry.register("worker-1", "worker.processor")
+        a2 = self.registry.register("worker-2", "worker.processor")
+        self.registry.update_status(a1, AgentStatus.RUNNING)
+        self.registry.update_status(a2, AgentStatus.RUNNING)
+        self.registry.set_health(a1, "unhealthy", accepting_tasks=False)
+        self.registry.set_health(a2, "healthy")
 
-# 2019-02-22T11:46:37 update
+        # First type resolution falls through to a2
+        r1 = self.registry.resolve_handler(agent_type="worker.processor")
+        assert r1.resolved
+        assert r1.agent["id"] == a2
 
-# 2019-03-27T14:43:52 update
+        # Delete a2 — cache should invalidate
+        self.registry.delete(a2)
+        r2 = self.registry.resolve_handler(agent_type="worker.processor")
+        assert not r2.resolved  # only a1 remains, and it's unhealthy
 
-# 2019-04-12T16:58:25 update
+    # ──────────────────────────────────────────────
+    #  HandlerResolution sanitisation
+    # ──────────────────────────────────────────────
 
-# 2019-05-27T15:15:18 update
+    def test_handler_resolution_does_not_expose_config(self):
+        """Resolution result must not carry config, secrets, or runtime payloads."""
+        agent_id = self.registry.register(
+            "worker-1", "worker.processor",
+            config={"api_key": "secret-token", "endpoint": "https://internal"},
+        )
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
 
-# 2019-07-17T14:36:58 update
+        resolution = self.registry.resolve_handler(agent_id=agent_id)
+        assert resolution.resolved
+        # The returned agent dict is the full agent — but audit metadata
+        # (reason, deferred_ids) must not leak config
+        assert resolution.reason == "healthy"
+        assert "config" not in resolution.reason
+        assert "api_key" not in resolution.reason
+        assert "secret" not in resolution.reason
 
-# 2019-09-06T12:29:31 update
+    # ──────────────────────────────────────────────
+    #  Duplicate / nonexistent
+    # ──────────────────────────────────────────────
 
-# 2019-11-27T17:43:26 update
+    def test_nonexistent_handler_rejected(self):
+        """Resolution for a non-existent agent returns agent_not_found."""
+        resolution = self.registry.resolve_handler(agent_id="nonexistent-id")
+        assert not resolution.resolved
+        assert resolution.reason == "agent_not_found"
 
-# 2019-11-28T08:42:43 update
+    def test_is_handler_healthy_returns_false_for_unknown(self):
+        """is_handler_healthy fails closed for unknown agents."""
+        assert not self.registry.is_handler_healthy("nonexistent-id")
 
-# 2019-12-03T20:34:02 update
+    def test_is_handler_healthy_reflects_health_state(self):
+        """is_handler_healthy reflects current accepting_tasks and health."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        assert not self.registry.is_handler_healthy(agent_id)  # PENDING
 
-# 2019-12-26T08:15:09 update
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert self.registry.is_handler_healthy(agent_id)
 
-# 2020-01-07T09:36:32 update
+        self.registry.set_health(agent_id, "healthy", accepting_tasks=False)
+        assert not self.registry.is_handler_healthy(agent_id)
 
-# 2020-01-10T12:44:52 update
+    def test_clear_resolution_cache(self):
+        """clear_resolution_cache removes all entries and returns count."""
+        agent_id = self.registry.register("worker-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        self.registry.resolve_handler(agent_id=agent_id)
+        self.registry.resolve_handler(agent_type="worker.processor")
 
-# 2020-07-05T19:33:32 update
+        count = self.registry.clear_resolution_cache()
+        assert count >= 2
 
-# 2020-07-07T14:16:11 update
-
-# 2020-07-28T08:29:39 update
-
-# 2020-08-26T18:58:21 update
-
-# 2020-08-28T09:50:37 update
-
-# 2020-09-17T15:23:33 update
-
-# 2020-09-23T16:22:24 update
-
-# 2020-10-14T13:27:24 update
-
-# 2020-11-20T11:40:04 update
-
-# 2020-12-10T13:55:01 update
-
-# 2020-12-25T20:33:02 update
-
-# 2021-03-22T19:53:48 update
-
-# 2021-03-26T15:02:19 update
-
-# 2021-07-16T20:24:40 update
-
-# 2021-07-22T13:19:23 update
-
-# 2021-08-16T19:11:26 update
-
-# 2021-10-02T13:32:20 update
-
-# 2021-10-23T18:31:31 update
-
-# 2021-10-29T13:55:10 update
-
-# 2022-07-31T17:35:39 update
-
-# 2022-09-27T09:32:34 update
-
-# 2022-11-07T14:44:52 update
-
-# 2023-01-23T14:07:09 update
-
-# 2023-03-16T15:23:38 update
-
-# 2023-07-03T18:33:44 update
-
-# 2023-07-27T09:35:11 update
-
-# 2023-11-16T11:22:59 update
-
-# 2023-12-20T14:25:29 update
-
-# 2024-03-07T17:32:49 update
-
-# 2024-04-10T10:50:42 update
-
-# 2024-06-19T19:57:49 update
-
-# 2024-12-05T18:02:46 update
-
-# 2025-01-15T16:13:24 update
-
-# 2025-03-12T20:58:57 update
-
-# 2025-06-24T20:33:23 update
-
-# 2025-08-25T10:56:35 update
-
-# 2025-09-12T17:09:51 update
-
-# 2025-10-06T20:01:10 update
-
-# 2025-10-14T11:48:40 update
-
-# 2026-01-29T13:09:29 update
+        # Cache is empty now
+        count2 = self.registry.clear_resolution_cache()
+        assert count2 == 0

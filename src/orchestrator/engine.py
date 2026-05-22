@@ -5,7 +5,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
-from src.agent import AgentRegistry, AgentStatus
+from src.agent import AgentRegistry, AgentStatus, HandlerResolution
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
@@ -134,16 +134,35 @@ class OrchestrationEngine:
     async def _execute_task(self, task: Dict[str, Any]) -> None:
         task_id = task["id"]
         agent_id = task["target_agent"]
+        logger.info(f"Resolving handler for task {task_id} on agent {agent_id}")
+
+        # ── Health-aware handler resolution ──
+        resolution = self.registry.resolve_handler(agent_id=agent_id)
+        if not resolution.resolved:
+            logger.info(
+                f"Task {task_id} deferred — {resolution.reason}",
+                extra={
+                    "task_id": task_id,
+                    "target_agent": agent_id,
+                    "reason": resolution.reason,
+                },
+            )
+            self.dispatch_decisions.append({
+                "task_id": task_id,
+                "target_agent": agent_id,
+                "allowed": False,
+                "reason": resolution.reason,
+                "deferred_ids": resolution.deferred_ids,
+            })
+            return
+
+        agent = resolution.agent
         logger.info(f"Executing task {task_id} on agent {agent_id}")
 
         for hook in self._hooks["pre_execute"]:
             await hook(task)
 
         try:
-            agent = self.registry.get(agent_id)
-            if not agent:
-                raise ValueError(f"Agent {agent_id} not found")
-
             self.registry.update_status(agent_id, AgentStatus.RUNNING)
             result = await asyncio.wait_for(
                 self._run_agent_task(agent, task),

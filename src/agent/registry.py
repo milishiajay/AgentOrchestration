@@ -3,7 +3,7 @@
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 class AgentStatus(Enum):
@@ -13,6 +13,35 @@ class AgentStatus(Enum):
     STOPPED = "stopped"
     FAILED = "failed"
     TERMINATED = "terminated"
+    DRAINING = "draining"
+
+
+# Terminal states that should never accept tasks
+_TERMINAL_STATUSES = {AgentStatus.STOPPED, AgentStatus.TERMINATED, AgentStatus.FAILED}
+# States where a handler exists but should not receive new work
+_UNROUTABLE_STATUSES = _TERMINAL_STATUSES | {AgentStatus.PENDING, AgentStatus.DRAINING}
+
+
+class HandlerResolution:
+    """Result of a health-aware handler resolution.
+
+    Carries sanitized metadata for audit/monitoring without
+    exposing private config, secrets, or runtime payloads.
+    """
+
+    __slots__ = ("resolved", "agent", "reason", "deferred_ids")
+
+    def __init__(
+        self,
+        resolved: bool,
+        agent: Optional[Dict[str, Any]] = None,
+        reason: str = "",
+        deferred_ids: Optional[List[str]] = None,
+    ):
+        self.resolved = resolved
+        self.agent = agent
+        self.reason = reason
+        self.deferred_ids = deferred_ids or []
 
 
 class AgentRegistry:
@@ -20,6 +49,8 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._resolution_cache: Dict[str, Tuple[float, HandlerResolution]] = {}
+        self._cache_ttl: float = 5.0
 
     def register(
         self,
@@ -43,6 +74,8 @@ class AgentRegistry:
             "updated_at": timestamp,
             "last_reconnected_at": timestamp,
             "version": "1.0.0",
+            "accepting_tasks": True,
+            "health": "healthy",
             "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
             "audit": [{
                 "event": "worker_registered",
@@ -54,6 +87,7 @@ class AgentRegistry:
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._invalidate_cache_for(agent_id)
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
@@ -77,6 +111,7 @@ class AgentRegistry:
             return False
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate_cache_for(agent_id)
         return True
 
     def refresh_capabilities(
@@ -103,6 +138,7 @@ class AgentRegistry:
             "capability_epoch": agent["capability_epoch"],
             "capability_count": len(capability_list),
         })
+        self._invalidate_cache_for(agent_id)
         return self.worker_snapshot(agent_id)
 
     def worker_snapshot(self, agent_id: str) -> Optional[Dict[str, Any]]:
@@ -120,14 +156,208 @@ class AgentRegistry:
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:
             return False
+        agent_group = self._agents[agent_id]["type"].split(".")[0]
         agent = self._agents.pop(agent_id)
-        group = agent["type"].split(".")[0]
-        if group in self._index and agent_id in self._index[group]:
-            self._index[group].remove(agent_id)
+        if agent_group in self._index and agent_id in self._index[agent_group]:
+            self._index[agent_group].remove(agent_id)
+        self._invalidate_cache_for(agent_id, group=agent_group)
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    # ──────────────────────────────────────────────
+    #  Health-aware handler resolution
+    # ──────────────────────────────────────────────
+
+    def set_health(
+        self,
+        agent_id: str,
+        health: str,
+        accepting_tasks: bool = True,
+    ) -> bool:
+        """Update handler health state for rolling deploys.
+
+        When a handler is marked as not accepting tasks or unhealthy,
+        the resolution cache is invalidated so subsequent routing
+        decisions will defer or skip the handler.
+        """
+        if agent_id not in self._agents:
+            return False
+        self._agents[agent_id]["health"] = health
+        self._agents[agent_id]["accepting_tasks"] = accepting_tasks
+        self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate_cache_for(agent_id)
+        return True
+
+    def resolve_handler(
+        self,
+        agent_id: Optional[str] = None,
+        agent_type: Optional[str] = None,
+        required_capability: Optional[str] = None,
+        required_version: Optional[str] = None,
+    ) -> HandlerResolution:
+        """Health-aware handler resolution for routing.
+
+        Checks handler health, status, accepting_tasks flag,
+        capability compatibility, and version match before
+        returning a routable handler.
+
+        If an exact agent_id is provided, only that handler is checked.
+        Otherwise, iterates handlers of the given type (or all handlers)
+        to find the first healthy, compatible one.
+
+        Resolution results are cached with a short TTL and invalidated
+        on any lifecycle/health change.
+        """
+        # Build cache key from inputs
+        cache_key = f"{agent_id}:{agent_type}:{required_capability}:{required_version}"
+        cached = self._resolution_cache.get(cache_key)
+        if cached and (time.time() - cached[0]) < self._cache_ttl:
+            return cached[1]
+
+        result = self._resolve_handler_impl(
+            agent_id=agent_id,
+            agent_type=agent_type,
+            required_capability=required_capability,
+            required_version=required_version,
+        )
+        self._resolution_cache[cache_key] = (time.time(), result)
+        return result
+
+    def is_handler_healthy(self, agent_id: str) -> bool:
+        """Check if a specific handler is healthy and routable."""
+        agent = self._agents.get(agent_id)
+        if not agent:
+            return False
+        return self._check_handler_routable(agent)
+
+    def _resolve_handler_impl(
+        self,
+        agent_id: Optional[str] = None,
+        agent_type: Optional[str] = None,
+        required_capability: Optional[str] = None,
+        required_version: Optional[str] = None,
+    ) -> HandlerResolution:
+        deferred: List[str] = []
+
+        # Exact-agent-id path
+        if agent_id is not None:
+            agent = self._agents.get(agent_id)
+            if not agent:
+                return HandlerResolution(False, reason="agent_not_found")
+            if not self._check_handler_routable(agent):
+                deferred.append(agent_id)
+                return HandlerResolution(
+                    False,
+                    reason=f"handler_unroutable:{agent['status']}",
+                    deferred_ids=deferred,
+                )
+            if required_capability and required_capability not in set(
+                agent.get("capabilities", [])
+            ):
+                return HandlerResolution(
+                    False,
+                    reason="missing_capability",
+                    deferred_ids=[agent_id],
+                )
+            if required_version and agent.get("version") != required_version:
+                return HandlerResolution(
+                    False,
+                    reason="version_mismatch",
+                    deferred_ids=[agent_id],
+                )
+            return HandlerResolution(True, agent=agent, reason="healthy")
+
+        # Type-based or all-handlers path
+        candidates = list(self._agents.values())
+        if agent_type:
+            group_prefix = agent_type.split(".")[0]
+            group_ids = self._index.get(group_prefix, [])
+            candidates = [
+                a for a in candidates if a["id"] in group_ids
+            ]
+
+        for agent in candidates:
+            if not self._check_handler_routable(agent):
+                deferred.append(agent["id"])
+                continue
+            if required_capability and required_capability not in set(
+                agent.get("capabilities", [])
+            ):
+                deferred.append(agent["id"])
+                continue
+            if required_version and agent.get("version") != required_version:
+                deferred.append(agent["id"])
+                continue
+            return HandlerResolution(
+                True, agent=agent, reason="healthy", deferred_ids=deferred,
+            )
+
+        reason = "no_healthy_handler" if not deferred else "all_deferred"
+        return HandlerResolution(False, reason=reason, deferred_ids=deferred)
+
+    def _check_handler_routable(self, agent: Dict[str, Any]) -> bool:
+        """Check if a handler is healthy enough to route to."""
+        status = agent.get("status", "")
+        try:
+            status_enum = AgentStatus(status)
+        except ValueError:
+            return False
+
+        # Terminal and unready states are unroutable
+        if status_enum in _UNROUTABLE_STATUSES:
+            return False
+
+        # PENDING is not routable (not yet initialized)
+        if status_enum == AgentStatus.PENDING:
+            return False
+
+        # Must be accepting tasks
+        if not agent.get("accepting_tasks", True):
+            return False
+
+        # Health must be "healthy"
+        if agent.get("health", "healthy") != "healthy":
+            return False
+
+        return True
+
+    # ──────────────────────────────────────────────
+    #  Resolution cache management
+    # ──────────────────────────────────────────────
+
+    def _invalidate_cache_for(self, agent_id: str, group: Optional[str] = None) -> None:
+        """Invalidate all cached resolution entries referencing agent_id.
+
+        Called on any lifecycle change: register, status change,
+        health change, capability refresh, or deletion.
+
+        When group is not provided, it's looked up from the agent
+        entry (if the agent hasn't been deleted yet).
+        """
+        # Resolve group if not explicitly provided
+        if group is None:
+            agent = self._agents.get(agent_id)
+            if agent:
+                group = agent["type"].split(".")[0]
+
+        to_remove = []
+        for key in self._resolution_cache:
+            key_parts = key.split(":")
+            if agent_id in key_parts:
+                to_remove.append(key)
+            elif group and key_parts[0] == "None" and key_parts[1] and key_parts[1].startswith(group):
+                if key not in to_remove:
+                    to_remove.append(key)
+        for key in to_remove:
+            self._resolution_cache.pop(key, None)
+
+    def clear_resolution_cache(self) -> int:
+        """Clear all resolution cache entries. Returns count of entries cleared."""
+        count = len(self._resolution_cache)
+        self._resolution_cache.clear()
+        return count
 
     @staticmethod
     def _normalize_capabilities(

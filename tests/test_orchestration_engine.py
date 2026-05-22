@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from src.orchestrator.engine import OrchestrationEngine
+from src.agent.registry import AgentStatus
 
 
 class TestOrchestrationEngine:
@@ -152,3 +153,91 @@ class TestOrchestrationEngine:
             "target_agent": "nonexistent",
             "reason": "agent_not_found",
         }
+
+    # ══════════════════════════════════════════════
+    #  Rolling deploy health gate tests — #570
+    # ══════════════════════════════════════════════
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_target_rejected_before_execution(self):
+        """An unhealthy rolling-deploy target is not executed and state is preserved."""
+        agent_id = self.engine.registry.register("worker-1", "worker.processor")
+        self.engine.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        # Simulate rolling deploy: handler stops accepting tasks
+        self.engine.registry.set_health(agent_id, "unhealthy", accepting_tasks=False)
+
+        # Create task targeting the now-unhealthy handler
+        task = {"id": "task-1", "type": "process", "target_agent": agent_id}
+        await self.engine._execute_task(task)
+
+        # Task should have been deferred, not executed
+        decisions = [
+            d for d in self.engine.dispatch_decisions if d["task_id"] == "task-1"
+        ]
+        assert len(decisions) >= 1
+        assert not decisions[-1]["allowed"]
+        assert "handler_unroutable" in decisions[-1]["reason"]
+
+        # Handler should NOT have been transitioned (state preserved)
+        agent = self.engine.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.RUNNING.value
+
+    @pytest.mark.asyncio
+    async def test_healthy_target_still_executes(self):
+        """A healthy exact target still runs and transitions to paused."""
+        agent_id = self.engine.registry.register("worker-1", "worker.processor")
+        self.engine.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        task = {"id": "task-2", "type": "process", "target_agent": agent_id}
+        await self.engine._execute_task(task)
+
+        # Healthy target should be executed and transition to paused
+        agent = self.engine.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.PAUSED.value
+
+    @pytest.mark.asyncio
+    async def test_draining_target_rejected_before_execution(self):
+        """A draining target is rejected and stays in prior lifecycle state."""
+        agent_id = self.engine.registry.register("worker-1", "worker.processor")
+        self.engine.registry.update_status(agent_id, AgentStatus.DRAINING)
+
+        task = {"id": "task-3", "type": "process", "target_agent": agent_id}
+        await self.engine._execute_task(task)
+
+        decisions = [
+            d for d in self.engine.dispatch_decisions
+            if d["task_id"] == "task-3"
+        ]
+        assert len(decisions) >= 1
+        assert not decisions[-1]["allowed"]
+        assert "handler_unroutable" in decisions[-1]["reason"]
+
+        # Handler should NOT have been transitioned
+        agent = self.engine.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.DRAINING.value
+
+    @pytest.mark.asyncio
+    async def test_audit_metadata_sanitized_on_deferral(self):
+        """Sanitized audit metadata is recorded without private config info."""
+        agent_id = self.engine.registry.register(
+            "worker-1",
+            "worker.processor",
+            config={"api_key": "top-secret", "endpoint": "https://private"},
+        )
+        self.engine.registry.update_status(agent_id, AgentStatus.RUNNING)
+        self.engine.registry.set_health(agent_id, "healthy", accepting_tasks=False)
+
+        task = {"id": "task-4", "type": "process", "target_agent": agent_id}
+        await self.engine._execute_task(task)
+
+        decisions = [
+            d for d in self.engine.dispatch_decisions
+            if d["task_id"] == "task-4"
+        ]
+        assert len(decisions) >= 1
+        decision = decisions[-1]
+        # Audit record must not leak config
+        assert decision["reason"] is not None
+        assert "api_key" not in str(decision)
+        assert "top-secret" not in str(decision)

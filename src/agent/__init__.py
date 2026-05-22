@@ -1,6 +1,6 @@
 """Agent lifecycle management module."""
 
-from .registry import AgentRegistry, AgentStatus
+from .registry import AgentRegistry, AgentStatus, HandlerResolution
 from .executor import AgentExecutor
 from .runtime import AgentRuntime
 from .sandbox import AgentSandbox
@@ -8,6 +8,7 @@ from .sandbox import AgentSandbox
 __all__ = [
     "AgentRegistry",
     "AgentStatus",
+    "HandlerResolution",
     "AgentExecutor",
     "AgentRuntime",
     "AgentSandbox",
