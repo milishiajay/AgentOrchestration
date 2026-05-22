@@ -81,3 +81,15 @@ class TestDeployCommand:
         """deploy --help should mention --dry-run flag."""
         result = run_cli(["deploy", "--help"])
         assert "--dry-run" in result.stdout
+
+    def test_deploy_missing_manifest_exits_nonzero(self):
+        """Deploy with a non-existent manifest should fail before printing progress."""
+        result = run_cli(["deploy", "/nonexistent/path/manifest.yaml"])
+        assert result.returncode != 0
+        assert "manifest file not found" in result.stderr
+
+    def test_deploy_missing_manifest_no_progress_message(self):
+        """Deploy with a missing manifest must NOT print 'Deploying' or '[DRY RUN]'."""
+        result = run_cli(["deploy", "/nonexistent/path/manifest.yaml"])
+        assert "Deploying agent from manifest" not in result.stdout
+        assert "[DRY RUN]" not in result.stdout

@@ -1,6 +1,7 @@
 """CLI entry point for the agent orchestrator."""
 
 import argparse
+import os
 import sys
 
 from src.common.config import Config
@@ -42,6 +43,9 @@ def cli():
     if args.command == "init":
         print(f"Initializing project: {args.name}")
     elif args.command == "deploy":
+        if not os.path.isfile(args.manifest):
+            print("Error: manifest file not found: {}".format(args.manifest), file=sys.stderr)
+            sys.exit(1)
         if args.dry_run:
             print("[DRY RUN] Would deploy agent from manifest: {}".format(args.manifest))
             print("[DRY RUN] Manifest path: {}".format(args.manifest))
