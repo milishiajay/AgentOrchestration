@@ -19,6 +19,11 @@ def cli():
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
+    deploy_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview deployment without actually deploying",
+    )
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
     status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
@@ -37,7 +42,12 @@ def cli():
     if args.command == "init":
         print(f"Initializing project: {args.name}")
     elif args.command == "deploy":
-        print(f"Deploying agent from manifest: {args.manifest}")
+        if args.dry_run:
+            print("[DRY RUN] Would deploy agent from manifest: {}".format(args.manifest))
+            print("[DRY RUN] Manifest path: {}".format(args.manifest))
+            print("[DRY RUN] No actual deployment was performed.")
+        else:
+            print("Deploying agent from manifest: {}".format(args.manifest))
     elif args.command == "status":
         print("Checking agent status...")
     elif args.command == "logs":
