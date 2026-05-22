@@ -1,10 +1,9 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 
 class AgentStatus(Enum):
@@ -22,19 +21,34 @@ class AgentRegistry:
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+        capabilities: Optional[Iterable[str]] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
+        capability_list = self._normalize_capabilities(capabilities)
         self._agents[agent_id] = {
             "id": agent_id,
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
             "config": config or {},
+            "capabilities": capability_list,
+            "capability_epoch": 1,
             "created_at": timestamp,
             "updated_at": timestamp,
+            "last_reconnected_at": timestamp,
             "version": "1.0.0",
             "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
+            "audit": [{
+                "event": "worker_registered",
+                "capability_epoch": 1,
+                "capability_count": len(capability_list),
+            }],
         }
         group = agent_type.split(".")[0]
         if group not in self._index:
@@ -45,7 +59,11 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -61,6 +79,44 @@ class AgentRegistry:
         self._agents[agent_id]["updated_at"] = time.time()
         return True
 
+    def refresh_capabilities(
+        self,
+        agent_id: str,
+        capabilities: Iterable[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Refresh worker capabilities on reconnect.
+
+        Updates the worker's capability set, bumps the monotonic epoch,
+        records a sanitized audit entry, and returns a snapshot suitable
+        for scheduler claim validation.
+        """
+        if agent_id not in self._agents:
+            return None
+        capability_list = self._normalize_capabilities(capabilities)
+        agent = self._agents[agent_id]
+        agent["capabilities"] = capability_list
+        agent["capability_epoch"] += 1
+        agent["updated_at"] = time.time()
+        agent["last_reconnected_at"] = agent["updated_at"]
+        agent["audit"].append({
+            "event": "worker_capabilities_refreshed",
+            "capability_epoch": agent["capability_epoch"],
+            "capability_count": len(capability_list),
+        })
+        return self.worker_snapshot(agent_id)
+
+    def worker_snapshot(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        """Return a claims-safe worker snapshot for scheduler validation."""
+        agent = self._agents.get(agent_id)
+        if not agent:
+            return None
+        return {
+            "id": agent["id"],
+            "status": agent["status"],
+            "capabilities": list(agent["capabilities"]),
+            "capability_epoch": agent["capability_epoch"],
+        }
+
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:
             return False
@@ -72,6 +128,18 @@ class AgentRegistry:
 
     def count(self) -> int:
         return len(self._agents)
+
+    @staticmethod
+    def _normalize_capabilities(
+        capabilities: Optional[Iterable[str]],
+    ) -> List[str]:
+        if not capabilities:
+            return []
+        return sorted({
+            capability.strip().lower()
+            for capability in capabilities
+            if capability and capability.strip()
+        })
 
 # 2019-01-29T11:24:49 update
 

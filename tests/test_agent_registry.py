@@ -40,6 +40,70 @@ class TestAgentRegistry:
         agent = self.registry.get(agent_id)
         assert agent["status"] == "running"
 
+    def test_refresh_worker_capabilities_on_reconnect(self):
+        """Capabilities are refreshed on reconnect with a bumped epoch."""
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            capabilities=["summarize", "embed"],
+        )
+
+        snapshot = self.registry.refresh_capabilities(
+            agent_id,
+            ["search", "summarize"],
+        )
+
+        assert snapshot == {
+            "id": agent_id,
+            "status": "pending",
+            "capabilities": ["search", "summarize"],
+            "capability_epoch": 2,
+        }
+        agent = self.registry.get(agent_id)
+        assert agent["capabilities"] == ["search", "summarize"]
+        assert agent["audit"][-1] == {
+            "event": "worker_capabilities_refreshed",
+            "capability_epoch": 2,
+            "capability_count": 2,
+        }
+
+    def test_register_with_capabilities_stores_epoch_and_audit(self):
+        """Registration with capabilities initialises epoch and audit."""
+        agent_id = self.registry.register(
+            "capable-worker",
+            "worker.processor",
+            capabilities=["  transcribe ", "embed", "", "TRANSCRIBE"],
+        )
+        agent = self.registry.get(agent_id)
+        assert agent["capabilities"] == ["embed", "transcribe"]
+        assert agent["capability_epoch"] == 1
+        assert agent["audit"][0] == {
+            "event": "worker_registered",
+            "capability_epoch": 1,
+            "capability_count": 2,
+        }
+
+    def test_worker_snapshot_returns_claims_safe_view(self):
+        """Worker snapshot returns only the fields needed for claims."""
+        agent_id = self.registry.register(
+            "snap-worker",
+            "worker.processor",
+            capabilities=["run"],
+        )
+        snapshot = self.registry.worker_snapshot(agent_id)
+        assert snapshot == {
+            "id": agent_id,
+            "status": "pending",
+            "capabilities": ["run"],
+            "capability_epoch": 1,
+        }
+
+    def test_worker_snapshot_returns_none_for_unknown_agent(self):
+        assert self.registry.worker_snapshot("missing") is None
+
+    def test_refresh_capabilities_returns_none_for_unknown_agent(self):
+        assert self.registry.refresh_capabilities("missing", ["run"]) is None
+
     def test_delete_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")
         assert self.registry.delete(agent_id)

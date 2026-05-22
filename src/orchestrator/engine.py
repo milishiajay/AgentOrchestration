@@ -14,7 +14,11 @@ logger = logging.getLogger(__name__)
 class OrchestrationEngine:
     def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
         self.registry = AgentRegistry()
-        self.scheduler = TaskScheduler()
+        self.dispatch_decisions: List[Dict[str, Any]] = []
+        self.scheduler = TaskScheduler(
+            dispatch_validator=self._validate_task_dispatch,
+            decision_recorder=self._record_dispatch_decision,
+        )
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
@@ -41,6 +45,91 @@ class OrchestrationEngine:
     def stop(self) -> None:
         self._running = False
         logger.info("Orchestration engine stopped")
+
+    # ──────────────────────────────────────────────
+    #  Enqueue with capability epoch pinning
+    # ──────────────────────────────────────────────
+
+    def enqueue_task(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        required_capability: Optional[str] = None,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        """Enqueue a task pinned to the worker's current capability epoch.
+
+        Before enqueueing, takes a snapshot of the worker's current
+        capability state.  This snapshot is used later by dispatch/claim
+        validation to ensure the worker hasn't reconnected with refreshed
+        capabilities since the task was enqueued.
+        """
+        worker_snapshot = self.registry.worker_snapshot(agent_id)
+        if not worker_snapshot:
+            raise ValueError(f"Agent {agent_id} not found")
+
+        scheduled_task = dict(task)
+        scheduled_task["target_agent"] = agent_id
+        scheduled_task["worker_capability_epoch"] = (
+            worker_snapshot["capability_epoch"]
+        )
+        if required_capability:
+            scheduled_task["required_capability"] = required_capability
+        return self.scheduler.enqueue(
+            scheduled_task,
+            queue=queue,
+            priority=priority,
+        )
+
+    # ──────────────────────────────────────────────
+    #  Dispatch validation (called by scheduler)
+    # ──────────────────────────────────────────────
+
+    def _validate_task_dispatch(
+        self,
+        task: Dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Validate a task against the current worker snapshot.
+
+        Called by TaskScheduler during dequeue to enforce the hot-reload
+        invariant: if the worker reconnected since the task was enqueued,
+        the task is deferred rather than sent to a potentially
+        under-capable worker.
+        """
+        agent_id = task.get("target_agent")
+        if not agent_id:
+            return True, "accepted"
+
+        worker_snapshot = self.registry.worker_snapshot(agent_id)
+        if not worker_snapshot:
+            return False, "agent_not_found"
+
+        worker_task = dict(task)
+        worker_task["target_agent"] = agent_id
+        decision = self.scheduler._worker_claim_decision(
+            worker_task,
+            worker_snapshot,
+        )
+        return decision == "claim", decision
+
+    def _record_dispatch_decision(
+        self,
+        task: Dict[str, Any],
+        reason: str,
+        allowed: bool,
+    ) -> None:
+        """Record a dispatch decision for audit/test inspection."""
+        self.dispatch_decisions.append({
+            "task_id": task.get("id"),
+            "target_agent": task.get("target_agent"),
+            "allowed": allowed,
+            "reason": reason,
+        })
+
+    # ──────────────────────────────────────────────
+    #  Task execution
+    # ──────────────────────────────────────────────
 
     async def _execute_task(self, task: Dict[str, Any]) -> None:
         task_id = task["id"]
@@ -82,7 +171,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
