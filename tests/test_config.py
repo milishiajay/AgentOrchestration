@@ -135,3 +135,18 @@ class TestConfig:
 # 2026-02-11T19:28:37 update
 
 # 2026-04-17T10:00:53 update
+
+    def test_to_dict_returns_copy_not_reference(self):
+        """Regression test: mutations to dict must not affect Config internals."""
+        config = Config()
+        config.set("nested", {"inner": "original"})
+        data = config.to_dict()
+
+        # Mutate the returned dict
+        data["nested"]["inner"] = "mutated!"
+
+        # Config internals must not be affected
+        assert config.get("nested.inner") == "original", (
+            "to_dict() must return a defensive copy. "
+            "Mutating the returned dict should not change config state."
+        )

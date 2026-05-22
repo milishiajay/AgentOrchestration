@@ -1,5 +1,6 @@
 """Configuration management module."""
 
+import copy
 import os
 import json
 from typing import Any, Dict, Optional
@@ -48,7 +49,7 @@ class Config:
         self._set_nested(key, value)
 
     def to_dict(self) -> Dict:
-        return self._data
+        return copy.deepcopy(self._data)
 
 # 2019-03-14T15:29:32 update
 
