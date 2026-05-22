@@ -34,9 +34,19 @@ class MetricsCollector:
         with self._lock:
             if metric in self._timers:
                 duration = time.time() - self._timers.pop(metric)
-                self.observe(metric, duration)
+                self._histograms[metric].append(duration)
                 return duration
         return 0.0
+
+    def provenance_check(
+        self, check_name: str, passed: bool, detail: str = ""
+    ) -> None:
+        """Record a provenance validation check result."""
+        self.increment(
+            "provenance.checks."
+            + ("passed" if passed else "failed")
+        )
+        self.increment(f"provenance.check.{check_name}.{'pass' if passed else 'fail'}")
 
     def snapshot(self) -> Dict:
         with self._lock:
