@@ -1,5 +1,6 @@
 import pytest
 from src.common.config import Config
+from src.common.errors import ConfigurationError
 
 
 class TestConfig:
@@ -31,6 +32,185 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+
+class TestConfigGetInt:
+    """Regression tests for Config.get_int — issue #503."""
+
+    # ── happy path ─────────────────────────────────────────────────
+
+    def test_json_integer(self):
+        """JSON integer values are returned as-is."""
+        config = Config()
+        config.set("max_workers", 12)
+        assert config.get_int("max_workers") == 12
+        assert isinstance(config.get_int("max_workers"), int)
+
+    def test_json_integer_zero(self):
+        """Zero is a valid integer limit."""
+        config = Config()
+        config.set("max_workers", 0)
+        assert config.get_int("max_workers") == 0
+
+    def test_json_integer_negative(self):
+        """Negative integers are passed through."""
+        config = Config()
+        config.set("offset", -5)
+        assert config.get_int("offset") == -5
+
+    def test_json_integer_large(self):
+        """Large integers are preserved exactly."""
+        config = Config()
+        config.set("big", 2 ** 63 - 1)
+        assert config.get_int("big") == 2 ** 63 - 1
+
+    # ── string coercion ────────────────────────────────────────────
+
+    def test_numeric_string(self):
+        """String values that look like integers are coerced."""
+        config = Config()
+        config.set("timeout", "30")
+        assert config.get_int("timeout") == 30
+        assert isinstance(config.get_int("timeout"), int)
+
+    def test_numeric_string_negative(self):
+        """Negative numeric strings are coerced."""
+        config = Config()
+        config.set("offset", "-10")
+        assert config.get_int("offset") == -10
+
+    def test_numeric_string_with_whitespace(self):
+        """Whitespace around the numeric string is tolerated."""
+        config = Config()
+        config.set("limit", "   42   ")
+        assert config.get_int("limit") == 42
+
+    # ── default handling ───────────────────────────────────────────
+
+    def test_default_int(self):
+        """When the key is missing, the supplied int default is returned."""
+        config = Config()
+        assert config.get_int("missing", 100) == 100
+
+    def test_default_none(self):
+        """When the key is missing and default is None, None is returned."""
+        config = Config()
+        assert config.get_int("missing") is None
+
+    def test_default_zero(self):
+        """Zero default is returned as-is (not ambiguous with None)."""
+        config = Config()
+        assert config.get_int("missing", 0) == 0
+
+    # ── boolean rejection ──────────────────────────────────────────
+
+    def test_boolean_true_rejected(self):
+        """True must not be silently coerced to 1."""
+        config = Config()
+        config.set("flag", True)
+        with pytest.raises(ConfigurationError, match="booleans are not valid"):
+            config.get_int("flag")
+
+    def test_boolean_false_rejected(self):
+        """False must not be silently coerced to 0."""
+        config = Config()
+        config.set("flag", False)
+        with pytest.raises(ConfigurationError, match="booleans are not valid"):
+            config.get_int("flag")
+
+    def test_boolean_default_rejected(self):
+        """A bool default is a programming error and should be flagged."""
+        config = Config()
+        with pytest.raises(ConfigurationError, match="default must be an int"):
+            config.get_int("missing", True)
+
+    # ── rejection of non-integer defaults ──────────────────────────
+
+    def test_float_default_rejected(self):
+        """Non-integer default raises ConfigurationError."""
+        config = Config()
+        with pytest.raises(ConfigurationError, match="default must be an int"):
+            config.get_int("missing", 3.14)
+
+    def test_str_default_rejected(self):
+        """String default raises ConfigurationError."""
+        config = Config()
+        with pytest.raises(ConfigurationError, match="default must be an int"):
+            config.get_int("missing", "hi")
+
+    # ── invalid stored values ──────────────────────────────────────
+
+    def test_invalid_string(self):
+        """A non-numeric string raises ConfigurationError."""
+        config = Config()
+        config.set("limit", "abc")
+        with pytest.raises(ConfigurationError, match="cannot coerce"):
+            config.get_int("limit")
+
+    def test_float_non_whole(self):
+        """A float with fractional part raises ConfigurationError."""
+        config = Config()
+        config.set("limit", 3.14)
+        with pytest.raises(
+            ConfigurationError, match="float value.*not a whole"
+        ):
+            config.get_int("limit")
+
+    def test_float_whole(self):
+        """A float that is a whole number is accepted (3.0 → 3)."""
+        config = Config()
+        config.set("limit", 3.0)
+        assert config.get_int("limit") == 3
+
+    def test_list_rejected(self):
+        """A list value raises ConfigurationError."""
+        config = Config()
+        config.set("limit", [1, 2, 3])
+        with pytest.raises(ConfigurationError, match="expected int"):
+            config.get_int("limit")
+
+    def test_dict_rejected(self):
+        """A dict value raises ConfigurationError."""
+        config = Config()
+        config.set("limit", {"a": 1})
+        with pytest.raises(ConfigurationError, match="expected int"):
+            config.get_int("limit")
+
+    def test_none_stored_value(self):
+        """None stored as a value returns the default."""
+        config = Config()
+        config.set("limit", None)
+        assert config.get_int("limit", 42) == 42
+
+    # ── env override integration ───────────────────────────────────
+
+    def test_env_override_coerces_numeric_string(self, monkeypatch):
+        """AO_ env overrides are stored as strings and must be coerced."""
+        monkeypatch.setenv("AO_LIMITS_MAX_WORKERS", "16")
+        config = Config()
+        # AO_LIMITS_MAX_WORKERS → limits.max.workers (all _ become .)
+        assert config.get_int("limits.max.workers") == 16
+
+    def test_env_override_invalid_string_raises(self, monkeypatch):
+        """Invalid AO_ env overrides produce clear errors."""
+        monkeypatch.setenv("AO_LIMITS_MAX_WORKERS", "notanumber")
+        config = Config()
+        with pytest.raises(ConfigurationError, match="cannot coerce"):
+            config.get_int("limits.max.workers")
+
+    # ── type correctness ──────────────────────────────────────────
+
+    def test_return_type_is_int(self):
+        """Successful calls always return int (or None)."""
+        config = Config()
+        config.set("a", 5)
+        assert isinstance(config.get_int("a"), int)
+
+    def test_dotted_path_resolution(self):
+        """get_int uses the same dotted-path resolution as get."""
+        config = Config()
+        config.set("nested.deep.key", 77)
+        assert config.get_int("nested.deep.key") == 77
 
 # 2019-02-01T18:58:35 update
 

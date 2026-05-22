@@ -44,6 +44,85 @@ class Config:
                 return default
         return current
 
+    def get_int(
+        self, key: str, default: Optional[int] = None
+    ) -> Optional[int]:
+        """Return an integer configuration value with strict type coercion.
+
+        Accepts JSON integer values and numeric string values (including
+        ``AO_`` environment override strings stored via
+        ``_load_env_overrides``).  Explicitly rejects Python booleans so
+        that ``True`` / ``False`` do not silently round-trip to ``1`` /
+        ``0``.
+
+        Args:
+            key: Dotted-path key (e.g. ``"limits.max_workers"``).
+            default: Fallback returned when the key is not present.
+                Must be an ``int`` or ``None``.
+
+        Returns:
+            The coerced integer value.
+
+        Raises:
+            ConfigurationError: If the stored value is not a valid integer,
+                is a boolean, or the *default* value itself is not an ``int``.
+        """
+        from src.common.errors import ConfigurationError
+
+        value = self.get(key)
+
+        # Key not present – fall back to the supplied default.
+        if value is None:
+            if default is None:
+                return None
+            if isinstance(default, bool):
+                raise ConfigurationError(
+                    f"Config key '{key}': default must be an int, "
+                    f"got bool ({default!r})"
+                )
+            if not isinstance(default, int):
+                raise ConfigurationError(
+                    f"Config key '{key}': default must be an int, "
+                    f"got {type(default).__name__} ({default!r})"
+                )
+            return default
+
+        # Explicitly reject booleans — bool is a subclass of int.
+        if isinstance(value, bool):
+            raise ConfigurationError(
+                f"Config key '{key}': booleans are not valid "
+                f"integer limits (got {value!r})"
+            )
+
+        # JSON integer — fast path.
+        if isinstance(value, int):
+            return value
+
+        # Numeric string (handles env-override strings).
+        if isinstance(value, str):
+            stripped = value.strip()
+            try:
+                return int(stripped)
+            except ValueError:
+                raise ConfigurationError(
+                    f"Config key '{key}': cannot coerce string "
+                    f"{stripped!r} to int"
+                )
+
+        # JSON float that is a whole number — accepted for convenience.
+        if isinstance(value, float):
+            if value == int(value):
+                return int(value)
+            raise ConfigurationError(
+                f"Config key '{key}': float value {value!r} "
+                f"is not a whole number"
+            )
+
+        raise ConfigurationError(
+            f"Config key '{key}': expected int, got "
+            f"{type(value).__name__} ({value!r})"
+        )
+
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)
 
